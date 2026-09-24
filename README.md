@@ -63,10 +63,14 @@ file only needs hand-editing when you skip that script.
 # dry run first
 .\deploy-patchmon-gpo.ps1 -Domain example.com -OU 'OU=Workstations,DC=example,DC=com' -WhatIf
 
-# for real, signing the installer with your code-signing cert
+# for real, letting the script sign the installer (it signs before it copies - correct order)
 .\deploy-patchmon-gpo.ps1 -Domain example.com -OU 'OU=Workstations,DC=example,DC=com' `
     -SignedCertThumbprint 'A1B2C3D4...'
 ```
+
+Signing it yourself? Leave `-SignedCertThumbprint` out and sign **after** step 2 below - this script
+copies the installer into SYSVOL with `-Force`, which would otherwise overwrite your signed copy. See
+[Code signing](#code-signing).
 
 This copies the installer to `\\example.com\SYSVOL\example.com\scripts\patchmon\`, writes a
 path-corrected copy of the task XML to your desktop, and creates + links the
@@ -121,26 +125,91 @@ PsExec64 \\workstation01 -s -h powershell -NoProfile -ExecutionPolicy Bypass -Fi
 
 ## Code signing
 
-You wanted a signed script so policy does not block it. Because the bootstrap token is no longer
-baked into a static file, only this one script needs signing.
+Only `patchmon-agent-install.ps1` needs signing - the bootstrap token is no longer baked into a
+separate static file, so there is one artefact to sign. Add `uninstall-patchmon-agent.ps1` if you
+enforce signing on clients.
+
+### Order matters: stage first, sign last
+
+`deploy-patchmon-gpo.ps1` copies the installer into SYSVOL with `-Force`. If you sign your working
+copy and *then* run that script, it overwrites the signed copy in SYSVOL with an unsigned one, and
+clients refuse to run it. So either let the script sign for you - it signs before it copies, which
+is the correct order:
 
 ```powershell
-# One-time: a code-signing cert from your internal CA (or a self-signed one for a small estate)
-$cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Example PatchMon Deployment' `
-    -CertStoreLocation Cert:\LocalMachine\My -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(3)
-Export-Certificate -Cert $cert -FilePath C:\Users\Public\patchmon-signing.cer   # distribute this one
+.\deploy-patchmon-gpo.ps1 -Domain example.com -OU 'OU=Workstations,DC=example,DC=com' -SignedCertThumbprint 'A1B2...'
+```
 
-# Every time you change the script
-Set-AuthenticodeSignature -FilePath .\patchmon-agent-install.ps1 -Certificate $cert `
+or sign it yourself after everything else has run:
+
+```powershell
+$staged = '\\example.com\SYSVOL\example.com\scripts\patchmon\patchmon-agent-install.ps1'
+Set-AuthenticodeSignature -FilePath $staged -Certificate $cert `
     -HashAlgorithm SHA256 -TimestampServer 'http://timestamp.digicert.com'
 ```
 
-For a self-signed cert, publish `patchmon-signing.cer` by GPO to **Trusted Root Certification
-Authorities** *and* **Trusted People** (or Trusted Publishers), otherwise clients still see it as
-untrusted. With a real AD CS template, only issuance is needed.
+With manual signing, sign **after** `deploy-patchmon-gpo.ps1` and after the GPMC paste, and remember
+that re-running that script for any reason undoes your signature. Signing is the last thing that
+happens to the file: an edit, a re-save in another encoding, or a formatter pass afterwards all break
+it. Sign a staging copy rather than your working copy if you want the repo copy to stay unsigned.
 
-Note that signing is about trust, not execution policy: the task uses
-`-ExecutionPolicy Bypass`, which is per-process and does not weaken the machine setting.
+Check from a client, not from the DC:
+
+```powershell
+Get-AuthenticodeSignature $staged | Select-Object Status, StatusMessage, SignerCertificate
+```
+
+| Status | What happened |
+| --- | --- |
+| `NotSigned` | something copied an unsigned file over your signed one - re-sign |
+| `HashMismatch` | the file changed after signing - re-sign |
+| `Valid` | good, as long as the chain is trusted (below) |
+
+### One-time certificate
+
+```powershell
+# A code-signing cert from your internal CA, or a self-signed one for a small estate
+$cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Example PatchMon Deployment' `
+    -CertStoreLocation Cert:\LocalMachine\My -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(3)
+Export-Certificate -Cert $cert -FilePath C:\Users\Public\patchmon-signing.cer   # distribute this one
+```
+
+What makes clients accept the signature:
+
+- **Code Signing EKU** (`1.3.6.1.5.5.7.3.3`). A TLS or authenticated-web-server cert is rejected
+  client-side even if `Set-AuthenticodeSignature` accepted it locally.
+- **A trusted chain.** A cert from an AD CS code-signing template is already trusted by every domain
+  member. A self-signed cert is not: publish `patchmon-signing.cer` by GPO to **Trusted Root
+  Certification Authorities** *and* **Trusted People** (or Trusted Publishers), then
+  `gpupdate /force` on the client.
+- **A timestamp** (`-TimestampServer`), so the signature survives cert expiry. That needs outbound
+  HTTPS from the machine doing the signing; sign without it if you cannot reach a timestamping
+  authority and accept that the signature dies with the cert.
+- **Revocation has to be checkable.** If the cert is revoked, or the client cannot reach the CRL, a
+  policy that requires trusted signatures can fail the run.
+
+### Signing and execution policy
+
+Signing does not by itself make anything run, and it does not fight the task's
+`-ExecutionPolicy Bypass`:
+
+- If nothing enforces signing, the task runs the script signed or unsigned. Signing is defence in
+  depth and keeps AppLocker/AV quieter.
+- If you enforce **AllSigned** / "Require signed scripts" by Group Policy, **`-ExecutionPolicy Bypass`
+  on the command line is ignored** - a GPO-configured execution policy outranks the parameter. Then
+  the signature must be trusted on every client, and the uninstaller must be signed too, because
+  that is the one you run by hand.
+
+### Never commit a signed script
+
+The `# SIG # Begin signature block` trailer embeds your X.509 certificate, and your name and email
+address are in it. Keep the repository copy unsigned; sign only the deployed copy. The pre-commit
+scanner will **not** catch this: the signature block is base64, so none of the hostname or
+credential rules fire on it. Check before committing:
+
+```powershell
+git show HEAD:patchmon-agent-install.ps1 | Select-String 'SIG # Begin' -Quiet   # must be False
+```
 
 ## Exit codes and logs
 

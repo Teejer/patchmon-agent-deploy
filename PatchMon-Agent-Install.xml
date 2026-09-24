@@ -1,71 +1,71 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!--
-  Task Scheduler definition for the PatchMon agent self-heal task.
-
-  Use it either in GPMC:
-    Computer Configuration > Preferences > Control Panel Settings > Scheduled Tasks
-    > New > Scheduled Task (At least Windows 7) > XML tab > paste this.
-  or import it locally with:
-    schtasks /create /tn "PatchMon Agent Install" /xml "PatchMon-Agent-Install.xml" /f
-
-  EDIT THIS LINE if your domain or SYSVOL path differs:
-    \\example.com\SYSVOL\example.com\scripts\patchmon\patchmon-agent-install.ps1
--->
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Date>2026-09-24T00:00:00</Date>
-    <Author>EXAMPLE PatchMon deployment</Author>
-    <Description>Checks the PatchMon agent is installed and reporting; installs it if missing. Runs as LocalSystem.</Description>
-    <URI>\PatchMon Agent Install</URI>
-  </RegistrationInfo>
-  <Principals>
-    <Principal id="Author">
-      <UserId>S-1-5-18</UserId>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>false</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
-    <Priority>7</Priority>
-    <RestartOnFailure>
-      <Interval>PT15M</Interval>
-      <Count>3</Count>
-    </RestartOnFailure>
-  </Settings>
-  <Triggers>
-    <BootTrigger>
-      <Enabled>true</Enabled>
-      <Delay>PT5M</Delay>
-    </BootTrigger>
-    <CalendarTrigger>
-      <StartBoundary>2026-09-24T03:15:00</StartBoundary>
-      <Enabled>true</Enabled>
-      <ScheduleByDay>
-        <DaysInterval>1</DaysInterval>
-      </ScheduleByDay>
-      <RandomDelay>PT2H</RandomDelay>
-    </CalendarTrigger>
-  </Triggers>
-  <Actions Context="Author">
-    <Exec>
-      <Command>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
-      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "\\example.com\SYSVOL\example.com\scripts\patchmon\patchmon-agent-install.ps1"</Arguments>
-      <WorkingDirectory>%SystemRoot%</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Task Scheduler definition for the PatchMon agent self-heal task.
+
+  Use it either in GPMC:
+    Computer Configuration > Preferences > Control Panel Settings > Scheduled Tasks
+    > New > Scheduled Task (At least Windows 7) > XML tab > paste this.
+  or import it locally with:
+    schtasks /create /tn "PatchMon Agent Install" /xml "PatchMon-Agent-Install.xml" /f
+
+  EDIT THIS LINE if your domain or SYSVOL path differs:
+    \\example.com\SYSVOL\example.com\scripts\patchmon\patchmon-agent-install.ps1
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2026-09-24T00:00:00</Date>
+    <Author>EXAMPLE PatchMon deployment</Author>
+    <Description>Checks the PatchMon agent is installed and reporting; installs it if missing. Runs as LocalSystem.</Description>
+    <URI>\PatchMon Agent Install</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT15M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT5M</Delay>
+    </BootTrigger>
+    <CalendarTrigger>
+      <StartBoundary>2026-09-24T03:15:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+      <RandomDelay>PT2H</RandomDelay>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "\\example.com\SYSVOL\example.com\scripts\patchmon\patchmon-agent-install.ps1"</Arguments>
+      <WorkingDirectory>%SystemRoot%</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
