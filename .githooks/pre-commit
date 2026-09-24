@@ -1,0 +1,29 @@
+#!/bin/sh
+# Pre-commit hook: this repo is public, so refuse commits that would carry a secret
+# or a site-internal hostname / RFC1918 address.
+#
+# Enable it once per clone:
+#     git config core.hooksPath .githooks
+#
+# Escape hatch when you really mean it (think first):
+#     git commit --no-verify
+
+if command -v pwsh >/dev/null 2>&1; then
+    PWSH=pwsh
+elif command -v powershell >/dev/null 2>&1; then
+    PWSH=powershell
+else
+    echo "pre-commit: neither pwsh nor powershell was found, so the secret scan could not run." >&2
+    echo "pre-commit: install PowerShell or commit with --no-verify if you are certain." >&2
+    exit 1
+fi
+
+"$PWSH" -NoProfile -ExecutionPolicy Bypass -File tests/Check-NoSecrets.ps1
+status=$?
+
+if [ $status -ne 0 ]; then
+    echo "" >&2
+    echo "commit blocked by tests/Check-NoSecrets.ps1" >&2
+fi
+
+exit $status

@@ -1,0 +1,19 @@
+# Site-specific values and anything copied out of your PatchMon server.
+# These stay on your workstation only - this repo is public.
+SITE-SETTINGS.local.md
+*.local.md
+*.local.ps1
+reference/
+
+# Signing material - never commit a private key or PFX.
+*.pfx
+*.p12
+*.key
+*.cer
+*.pvk
+
+# Runtime junk
+*.log
+logs/
+.vs/
+*.psd1.bak
