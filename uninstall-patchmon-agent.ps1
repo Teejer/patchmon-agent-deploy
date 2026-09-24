@@ -27,8 +27,10 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$InstallPath = (Join-Path $env:ProgramFiles 'PatchMon'),
-    [string]$ConfigPath = (Join-Path $env:ProgramData 'PatchMon'),
+    # Empty means the standard Windows folders; resolved below so a stripped
+    # environment cannot fail parameter binding before anything is printed.
+    [string]$InstallPath = '',
+    [string]$ConfigPath = '',
     [string]$ServiceName = 'PatchMonAgent',
     [string]$TaskName = 'PatchMon Agent Install',
     [switch]$RemoveData,
@@ -37,6 +39,17 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $whatIf = $DryRun.IsPresent
+
+if (-not $InstallPath) {
+    $pf = if ($env:ProgramFiles) { $env:ProgramFiles.TrimEnd('\') } else { [Environment]::GetFolderPath('ProgramFiles') }
+    if (-not $pf) { $pf = "$($env:SystemRoot.TrimEnd('\'))\Program Files" }
+    $InstallPath = Join-Path $pf 'PatchMon'
+}
+if (-not $ConfigPath) {
+    $pd = if ($env:ProgramData) { $env:ProgramData.TrimEnd('\') } else { [Environment]::GetFolderPath('CommonApplicationData') }
+    if (-not $pd) { $pd = "$($env:SystemRoot.TrimEnd('\'))\ProgramData" }
+    $ConfigPath = Join-Path $pd 'PatchMon'
+}
 
 function Step {
     param([scriptblock]$Action, [string]$Description)

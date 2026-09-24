@@ -31,7 +31,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $self = Split-Path -Leaf $MyInvocation.MyCommand.Path
-$rootDir = $PSScriptRoot
+# Empty when this script was piped or Invoke-Expression'd rather than run as a file.
+$rootDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
 $excludeSelf = $true
 
 $rules = @(

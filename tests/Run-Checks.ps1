@@ -1,5 +1,17 @@
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+# tests/Run-Checks.ps1 lives one level below the scripts it checks. $PSScriptRoot is
+# empty when this file is piped or Invoke-Expression'd, and the current directory may
+# be the repo root or anything else, so probe for the installer instead of assuming.
+$startedIn = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
+$root = $null
+foreach ($candidate in @((Split-Path -Parent $startedIn), $startedIn, (Get-Location).ProviderPath, (Split-Path -Parent (Get-Location).ProviderPath))) {
+    if ($candidate -and (Test-Path -LiteralPath (Join-Path $candidate 'patchmon-agent-install.ps1'))) { $root = $candidate; break }
+}
+if (-not $root) {
+    Write-Error 'Cannot find patchmon-agent-install.ps1 above this location. Run the tests from the repo root or its tests folder.'
+    exit 1
+}
+Write-Host "checking scripts in: $root"
 $src = Get-Content (Join-Path $root 'patchmon-agent-install.ps1') -Raw
 
 # --- extract Get-ServiceBinaryPath from the installer and exercise it offline ---
@@ -112,6 +124,27 @@ $defaults = Get-Content (Join-Path $root 'patchmon-agent-install.ps1') -Raw
 $keyDefault = [regex]::Match($defaults, '\[string\]\$AutoEnrollmentKey\s*=\s*"([^"]+)"').Groups[1].Value
 if ($keyDefault -like 'REPLACE_WITH_*') { Write-Host "PASS  shipped default is a placeholder ($keyDefault) so a forgotten edit fails loudly" }
 else { $fail++; Write-Host 'FAIL  AutoEnrollmentKey default is not a placeholder pattern' -ForegroundColor Red }
+
+# --- param defaults must not depend on a possibly-null variable ---
+# A param default that calls Join-Path on $env:ProgramFiles / $env:USERPROFILE fails
+# during parameter binding - before logging, before the RSAT check, before anything
+# readable. $PSScriptRoot is empty under iex/paste too. Windows fills most of these in,
+# so the only way to catch it is to look at the AST.
+$unsafeFiles = @('patchmon-agent-install.ps1', 'uninstall-patchmon-agent.ps1', 'deploy-patchmon-gpo.ps1')
+$unsafe = foreach ($f in $unsafeFiles) {
+    $tok = $null; $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root $f), [ref]$tok, [ref]$errs)
+    if ($errs) { "$f has parse errors"; continue }
+    foreach ($p in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ParameterAst] }, $true)) {
+        if (-not $p.Argument) { continue }
+        $txt = ($p.Argument.Extent.Text -replace '\s+', ' ').Trim()
+        if ($txt -match 'Join-Path' -or $txt -match '\$env:' -or $txt -match '\$PSScriptRoot') {
+            "$($p.Name.UserPath) = $txt  (${f}:$($p.Extent.StartLineNumber))"
+        }
+    }
+}
+if ($unsafe) { $fail++; Write-Host 'FAIL  unsafe param defaults (resolve these after the param block):' -ForegroundColor Red; $unsafe | ForEach-Object { Write-Host "        $_" } }
+else { Write-Host "PASS  no unsafe param defaults in $($unsafeFiles.Count) shipped scripts" }
 
 Write-Host ''
 if ($fail -eq 0) { Write-Host 'All checks passed.' } else { Write-Host "$fail check(s) failed"; exit 1 }

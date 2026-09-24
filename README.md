@@ -72,9 +72,26 @@ Signing it yourself? Leave `-SignedCertThumbprint` out and sign **after** step 2
 copies the installer into SYSVOL with `-Force`, which would otherwise overwrite your signed copy. See
 [Code signing](#code-signing).
 
-This copies the installer to `\\example.com\SYSVOL\example.com\scripts\patchmon\`, writes a
-path-corrected copy of the task XML to your desktop, and creates + links the
+This writes a path-corrected copy of the task XML to your desktop and creates + links the
 `PatchMon Agent Deployment` GPO.
+
+**Staging uses the DC's own local SYSVOL path** - `C:\Windows\SYSVOL\sysvol\<domain>\scripts\patchmon`
+- not `\\<domain>\SYSVOL\...`. Writing locally means no SMB access to the SYSVOL share is needed and
+its share permissions stay exactly as they are. That matters because the tempting fix for "access
+denied writing to SYSVOL" is to grant change permission to a wider group, which is a domain-wide
+mistake. DFSR replicates the folder regardless of what wrote to it, so clients still get the file.
+
+Consequences of local staging:
+
+- Run it **on a domain controller**. Off a DC there is no local path, so it falls back to the UNC and
+  warns you; a denial there is the share permissions working as intended. Pass `-StagePath` for a
+  share you own instead - the task path is rewritten to match.
+- **Let DFSR replicate before testing.** A client authenticates to whichever DC it likes; if that DC
+  has not replicated yet, the task fails with path not found. `repadmin /syncall /AdeP` to force it,
+  `repadmin /showrepl` to check.
+- The staged file is readable by every authenticated user in the domain and holds your auto-enrollment
+  token. If that is not acceptable, stage to a share ACL'd to `Domain Computers` plus Administrators
+  only, via `-StagePath '\\files01\patchmon$\scripts'`.
 
 ### 2. Attach the scheduled task (one GUI paste - no cmdlets exist for this)
 
@@ -274,6 +291,8 @@ does land here, rotate it in PatchMon first and rewrite history second.
 | Download fails, bootstrap fallback also fails | Agent binary not available for this OS/arch on the server, or a proxy is blocking the download |
 | Service created but not running | `Get-Content C:\ProgramData\PatchMon\patchmon-agent.log -Tail 50` - usually bad `config.yml` or the server is unreachable from that box |
 | Task never appears on the client | `gpresult /h report.html`; check the GPO link/WMI filtering and that the SYSVOL path is readable by `Domain Computers` |
+| Task fails with "path not found" on some clients only | SYSVOL has not replicated to the DC that client authenticates to: `repadmin /showrepl`, then `repadmin /syncall /AdeP` |
+| Helper warns it is using the current directory | You pasted the script into a console, `Invoke-Expression`'d it, or shipped it with `Invoke-Command -FilePath`, so there is no script folder to work from. Run the file, or pass `-SourceDir` |
 | Task exists but fails with "Access is denied" reading the script | SYSVOL share permissions, or the script was copied somewhere other than `\\example.com\SYSVOL\example.com\scripts\patchmon\` |
 | Agent installs then vanishes | Something (AppLocker/WDAC/AV) is quarantining the binary - allow-list `C:\Program Files\PatchMon` |
 

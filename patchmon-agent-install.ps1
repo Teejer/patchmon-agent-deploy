@@ -64,8 +64,12 @@ param(
     # ------------------------------------------------------------------ #
     #  Rarely changed                                                    #
     # ------------------------------------------------------------------ #
-    [string]$InstallPath = (Join-Path $env:ProgramFiles 'PatchMon'),
-    [string]$ConfigPath = (Join-Path $env:ProgramData 'PatchMon'),
+    # Empty means the standard Windows folders, worked out below. They are not
+    # defaults here because a param default that calls Join-Path on a missing
+    # environment variable fails before any logging exists - and this script runs
+    # unattended as SYSTEM, where the environment is not always what you expect.
+    [string]$InstallPath = '',
+    [string]$ConfigPath = '',
     [string]$FriendlyName = $env:COMPUTERNAME,
     # Only set this for a temporary self-signed-cert situation; install the CA cert instead.
     [bool]$SkipSslVerify = $false,
@@ -79,6 +83,29 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $ServiceDescription = 'PatchMon Agent - Monitors system packages and sends updates to PatchMon server'
+
+function Get-WindowsFolder {
+    # Env var first, then the shell API, then SystemRoot. A SYSTEM task can start with
+    # a stripped environment, and Join-Path on a null value fails before we can log.
+    param([string]$SpecialFolder, [string]$FromEnv)
+    if ($FromEnv) { return $FromEnv.TrimEnd('\') }
+    try {
+        $p = [Environment]::GetFolderPath($SpecialFolder)
+        if ($p) { return $p.TrimEnd('\') }
+    }
+    catch { }
+    $root = if ($env:SystemRoot) { $env:SystemRoot.TrimEnd('\') } else { 'C:\Windows' }
+    if ($SpecialFolder -eq 'ProgramFiles') { return "$root\Program Files" }
+    return "$root\ProgramData"
+}
+
+if (-not $InstallPath) {
+    $InstallPath = Join-Path (Get-WindowsFolder 'ProgramFiles' $env:ProgramFiles) 'PatchMon'
+}
+if (-not $ConfigPath) {
+    $ConfigPath = Join-Path (Get-WindowsFolder 'CommonApplicationData' $env:ProgramData) 'PatchMon'
+}
+
 $LogFile = Join-Path $ConfigPath 'deploy.log'
 
 function Write-Log {
@@ -147,7 +174,9 @@ if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 
 
 $binaryName = 'patchmon-agent.exe'
 $targetPath = Join-Path $InstallPath $binaryName
-$tempPath = Join-Path $env:TEMP "patchmon-agent-windows-$arch.exe"
+# GetTempPath() falls back to %SystemRoot%\Temp rather than returning null.
+$tmpDir = if ($env:TEMP) { $env:TEMP.TrimEnd('\') } else { [IO.Path]::GetTempPath().TrimEnd('\') }
+$tempPath = Join-Path $tmpDir "patchmon-agent-windows-$arch.exe"
 $configFile = Join-Path $ConfigPath 'config.yml'
 $serviceName = $ServiceName
 
