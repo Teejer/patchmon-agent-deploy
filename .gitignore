@@ -17,3 +17,4 @@ reference/
 logs/
 .vs/
 *.psd1.bak
+dc-credentials/

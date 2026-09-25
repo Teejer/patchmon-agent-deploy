@@ -25,6 +25,8 @@ being committed.
 | `tests/Run-Checks.ps1` | Offline sanity checks for the fiddly parsing in the installer. Run with `pwsh -File tests/Run-Checks.ps1` (works on Linux/macOS too). |
 | `tests/Check-NoSecrets.ps1` | Pre-commit scanner for credentials, internal hostnames and RFC1918 addresses. |
 | `.githooks/pre-commit` | Runs that scanner before every commit. Enable with `git config core.hooksPath .githooks`. |
+| `patchmon-dc-reporter.ps1` | Agent-less Windows Update reporter for DCs. **AGPL-3.0** (derived from PatchMon source, see [Domain controllers](#domain-controllers-no-agent)). |
+| `setup-patchmon-dcs.ps1` | Run from an admin workstation: enrolls each DC, stages the reporter, registers its scheduled task. Same AGPL note. |
 
 ## Site settings (change these before deploying)
 
@@ -139,6 +141,64 @@ Invoke-Command -ComputerName workstation01 -FilePath C:\Windows\Temp\patchmon-ag
 # or PsExec, from the DC
 PsExec64 \\workstation01 -s -h powershell -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\patchmon-agent-install.ps1 -RegisterScheduledTask
 ```
+
+## Domain controllers (no agent)
+
+Installing the agent binary on DCs is not permitted here, so DCs are covered differently:
+`patchmon-dc-reporter.ps1` is a plain script that collects the same Windows Update data the agent
+would and POSTs it to the same API endpoint, and `setup-patchmon-dcs.ps1` deploys it. Nothing is
+installed on a DC - no service, no binary, no agent.
+
+**Why this reports identically to a real agent:** the PatchMon agent is open source, and its Windows
+collector is itself a PowerShell script (`Get-HotFix` for installed KBs, the Windows Update Agent
+COM API for pending updates, two registry keys for reboot-pending). The reporter reproduces that
+collection and posts a full report to `POST /api/v1/hosts/update` with the same `X-API-ID`/`X-API-KEY`
+host credentials and the same JSON field names, so the DC shows up in the UI like any other host
+(`osType: Windows`, `packageManager: windows`, installed/pending updates, reboot flag). Two protocol
+details make this tractable: a report with no `sections` field is treated as a full report (only
+requirement: a non-empty packages array), and the server only validates section hashes it actually
+receives - so the reporter never has to reproduce the agent's canonical hashing or its
+ping/hash-gate check-in loop.
+
+**What a DC will NOT have:** third-party package inventory (the agent scans installed programs; the
+reporter reports Windows Update only), remote patch installation from the UI, agent self-update, and
+- depending on the DC - pending updates: the WUA COM API sometimes fails for non-interactive SYSTEM
+sessions, and the reporter then degrades to installed-KBs-only and says so in
+`C:\ProgramData\PatchMon-Reporter\report.log`. The PatchMon agent has the same limitation (it falls
+back to a PowerShell module we may not install on DCs either).
+
+**Deployment** (from an admin workstation or member server, never a DC; needs the C$ admin share and
+WinRM on the DCs):
+
+```powershell
+# same three placeholders as the installer, then:
+git update-index --skip-worktree setup-patchmon-dcs.ps1
+
+.\setup-patchmon-dcs.ps1 -WhatIf      # enumerate DCs, show the plan
+.\setup-patchmon-dcs.ps1              # enroll + stage + register task + first run
+.\setup-patchmon-dcs.ps1 -Status      # task results and log tails on every DC
+```
+
+Per DC it: auto-enrolls **from the workstation** (the shared enrollment secret never reaches a DC;
+the returned per-DC api_id/api_key are cached in `.\dc-credentials\`, which is gitignored - keep it
+ACL'd to yourself), copies the reporter to `C:\Program Files\PatchMon-Reporter` with its own
+`credentials.json`, strips inherited NTFS ACLs so only SYSTEM and Administrators can read them
+(this is why nothing goes through SYSVOL), registers a scheduled task as SYSTEM (boot +5 minutes,
+then daily 03:25) and runs it once, reporting the exit result.
+
+**Signing:** if your Default Domain Policy enforces AllSigned on DCs, the task's
+`-ExecutionPolicy Bypass` is ignored and `patchmon-dc-reporter.ps1` must be signed before staging
+(same cert as the installer). The setup script detects the enforced policy per DC and refuses to
+pretend an unsigned file will work.
+
+**Uninstall:** `.\setup-patchmon-dcs.ps1 -Uninstall` removes the task and folders; delete the host
+records in the PatchMon UI yourself (the script holds no admin API credentials).
+
+**Licence:** the reporter's collection logic and payload shapes are taken from the PatchMon agent
+(`agent-source-code/internal/packages/windows.go`), Copyright (c) PatchMon contributors, under
+AGPL-3.0-only. Those two files are therefore AGPL-3.0 covered work - attribution is in their headers.
+Using them internally on your own network carries no further obligation; if you redistribute them,
+the AGPL applies to them. The rest of this repository is unaffected.
 
 ## Code signing
 
@@ -304,10 +364,11 @@ Once HTTPS is on `patchmon.example.com`:
 ## Keeping this repo public
 
 The riskiest edit in this project is pasting your real auto-enrollment secret and real server name
-into `patchmon-agent-install.ps1` and then committing it to a public repo. Two things stop that:
+into `patchmon-agent-install.ps1` (and `setup-patchmon-dcs.ps1`, which carries the same three
+placeholders) and then committing it to a public repo. Two things stop that:
 
-1. `.gitignore` keeps `SITE-SETTINGS.local.md`, any `*.local.md`, `reference/` and all key material
-   (`*.pfx`, `*.key`, `*.cer`, ...) out of the repository.
+1. `.gitignore` keeps `SITE-SETTINGS.local.md`, any `*.local.md`, `reference/`, the DC credential
+   cache `dc-credentials/` and all key material (`*.pfx`, `*.key`, `*.cer`, ...) out of the repository.
 2. `tests/Check-NoSecrets.ps1` scans what you are about to commit for credential-looking literals,
    RFC1918 addresses and internal DNS names (`*.local`, `*.lan`, `*.internal`, ...) and fails the
    commit when it finds one.

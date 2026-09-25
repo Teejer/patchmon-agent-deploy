@@ -385,12 +385,110 @@ $keyDefault = [regex]::Match($defaults, '\[string\]\$AutoEnrollmentKey\s*=\s*"([
 if ($keyDefault -like 'REPLACE_WITH_*') { Write-Host "PASS  shipped default is a placeholder ($keyDefault) so a forgotten edit fails loudly" }
 else { $fail++; Write-Host 'FAIL  AutoEnrollmentKey default is not a placeholder pattern' -ForegroundColor Red }
 
+# --- DC reporter: payload assembly, executed from its marked block ---
+# The reporter's pure functions must produce exactly the JSON the server's
+# ReportPayload struct expects: full report (no sections/hashes keys), the
+# identity strings the server treats as Windows, and arrays that stay arrays
+# even with one element - PS 5.1's ConvertTo-Json breaks that, which would
+# fail the server's []string unmarshal with a 400.
+$reporterSrc = Get-Content (Join-Path $root 'patchmon-dc-reporter.ps1') -Raw
+$dcBlock = Get-MarkedBlock -Source $reporterSrc -Begin '# --- DC-REPORT-BEGIN' -End '# --- DC-REPORT-END'
+if (-not $dcBlock) {
+    $fail++
+    Write-Host 'FAIL  could not find the DC-REPORT markers in patchmon-dc-reporter.ps1' -ForegroundColor Red
+}
+else {
+    Invoke-Expression $dcBlock
+
+    # ConvertTo-JsonSafe primitives
+    $jsonOk = (ConvertTo-JsonSafe 'a"b\c') -eq '"a\"b\\c"' -and
+              (ConvertTo-JsonSafe @('one')) -eq '["one"]' -and
+              (ConvertTo-JsonSafe $true) -eq 'true' -and
+              (ConvertTo-JsonSafe $null) -eq 'null' -and
+              (ConvertTo-JsonSafe "a`nb") -eq '"a\nb"' -and
+              (ConvertTo-JsonSafe 1.5) -eq '1.5'
+    if ($jsonOk) { Write-Host 'PASS  ConvertTo-JsonSafe: escaping, single-element arrays, primitives' }
+    else { $fail++; Write-Host "FAIL  ConvertTo-JsonSafe: single-element array gave [$(ConvertTo-JsonSafe @('one'))]" -ForegroundColor Red }
+
+    # Get-HotFix mapping
+    $hf = [pscustomobject]@{ HotFixID = 'KB5034441'; Description = 'Security Update'; InstalledOn = [datetime]'2026-05-12' }
+    $hfPkg = New-HotfixPackage $hf
+    $hfOk = ($hfPkg['name'] -eq 'KB5034441') -and ($hfPkg['category'] -eq 'Windows Update') -and
+            ($hfPkg['currentVersion'] -eq 'installed') -and ($hfPkg['isSecurityUpdate'] -eq $true) -and
+            ($hfPkg['description'] -eq 'Installed 2026-05-12') -and ($hfPkg['wuaKb'] -eq 'KB5034441')
+    $hf2 = New-HotfixPackage ([pscustomobject]@{ HotFixID = 'KB1'; Description = 'Update Rollup'; InstalledOn = $null })
+    $hfOk = $hfOk -and ($hf2['isSecurityUpdate'] -eq $false) -and ($hf2['description'] -eq 'Installed')
+    if ($hfOk) { Write-Host 'PASS  Get-HotFix rows map to the agent WUA Package shape' }
+    else { $fail++; Write-Host 'FAIL  New-HotfixPackage mapping' -ForegroundColor Red }
+
+    # Full payload with a one-category pending entry (the single-element trap)
+    $identity = @{
+        hostname = 'DC01'; osVersion = 'Windows Server 2022 Datacenter'; architecture = 'x86_64'
+        kernelVersion = '10.0.20348'; machineId = 'aaaaaaaa-bbbb'; systemUptime = '3 days, 4 hours'
+        bootTime = '2026-09-22T06:00:00Z'; cpuModel = 'Xeon E5'; cpuCores = 8; ramInstalled = 32
+        diskDetails = @([ordered]@{ name = 'C:'; size = '127.0 GB'; mountpoint = 'C:' })
+        ip = '192.0.2.10'; gatewayIp = '192.0.2.1'; dnsServers = @('192.0.2.2')
+    }
+    $pendingPkg = [ordered]@{
+        name = 'Definition update (KB1)'; category = 'Windows Update'; currentVersion = 'pending'
+        needsUpdate = $true; isSecurityUpdate = $false; wuaGuid = 'g1'; wuaKb = 'KB1'
+        wuaSeverity = 'Important'; wuaCategories = @('Only One Category'); wuaSupportUrl = ''
+        wuaRevisionNumber = 7
+    }
+    $payload = New-ReportPayload -Identity $identity -Packages @((New-HotfixPackage $hf), $pendingPkg) `
+        -NeedsReboot $true -RebootReason 'Windows Update requires reboot' -ExecutionSeconds 4.2
+    $json = ConvertTo-JsonSafe $payload
+    $parsed = $null
+    try { $parsed = $json | ConvertFrom-Json } catch { }
+    $payloadOk = ($null -ne $parsed) -and
+        ($parsed.osType -eq 'Windows') -and
+        ($parsed.packageManager -eq 'windows') -and
+        ($parsed.agentVersion -eq 'ps-reporter 1.0') -and
+        ($json -notmatch '"sections"') -and ($json -notmatch '"hashes"') -and
+        ($json -match '"wuaCategories":\["Only One Category"\]') -and
+        ($parsed.needsReboot -eq $true) -and
+        ($parsed.rebootReason -eq 'Windows Update requires reboot') -and
+        ($parsed.bootTime -eq '2026-09-22T06:00:00Z')
+    if ($payloadOk) { Write-Host 'PASS  New-ReportPayload: full-report shape, arrays survive, server field names' }
+    else { $fail++; Write-Host "FAIL  New-ReportPayload:`n$json" -ForegroundColor Red }
+
+    # rebootReason must travel ONLY with needsReboot (server has no COALESCE guard on it)
+    $payload2 = New-ReportPayload -Identity $identity -Packages @((New-HotfixPackage $hf)) `
+        -NeedsReboot $false -RebootReason 'stale reason' -ExecutionSeconds 1
+    if (-not $payload2.Contains('rebootReason')) {
+        Write-Host 'PASS  rebootReason suppressed when needsReboot is false'
+    }
+    else { $fail++; Write-Host 'FAIL  rebootReason sent without needsReboot; server would rewrite the column unguarded' -ForegroundColor Red }
+}
+
+# --- AGPL attribution: the reporter embeds PatchMon-derived logic ---
+$attributionOk = ($reporterSrc -match 'AGPL-3\.0') -and ($reporterSrc -match 'github\.com/PatchMon/PatchMon')
+$setupSrc = Get-Content (Join-Path $root 'setup-patchmon-dcs.ps1') -Raw
+$attributionOk = $attributionOk -and ($setupSrc -match 'AGPL-3\.0')
+if ($attributionOk) { Write-Host 'PASS  AGPL attribution present in reporter and setup scripts' }
+else { $fail++; Write-Host 'FAIL  AGPL attribution missing - these files carry PatchMon-derived code' -ForegroundColor Red }
+
+# --- setup placeholders + preflight guard ---
+$setupKeyDefault = [regex]::Match($setupSrc, '\[string\]\$AutoEnrollmentKey\s*=\s*[""'']([^""'']+)[""'']').Groups[1].Value
+if ($setupKeyDefault -like 'REPLACE_WITH_*' -and $setupSrc -match '\-like ''\*REPLACE_WITH_\*''') {
+    Write-Host "PASS  setup-patchmon-dcs defaults are placeholders and checked before any network call"
+}
+else { $fail++; Write-Host 'FAIL  setup-patchmon-dcs placeholder defaults or preflight guard changed' -ForegroundColor Red }
+
+# --- per-DC credential cache must never be committable ---
+$ignoreTxt = Get-Content (Join-Path $root '.gitignore') -Raw
+if ($ignoreTxt -match '(?m)^dc-credentials/') {
+    Write-Host 'PASS  dc-credentials/ is gitignored (cached per-DC API keys)'
+}
+else { $fail++; Write-Host 'FAIL  add dc-credentials/ to .gitignore' -ForegroundColor Red }
+
 # --- param defaults must not depend on a possibly-null variable ---
 # A param default that calls Join-Path on $env:ProgramFiles / $env:USERPROFILE fails
 # during parameter binding - before logging, before the RSAT check, before anything
 # readable. $PSScriptRoot is empty under iex/paste too. Windows fills most of these in,
 # so the only way to catch it is to look at the AST.
-$unsafeFiles = @('patchmon-agent-install.ps1', 'uninstall-patchmon-agent.ps1', 'deploy-patchmon-gpo.ps1')
+$unsafeFiles = @('patchmon-agent-install.ps1', 'uninstall-patchmon-agent.ps1', 'deploy-patchmon-gpo.ps1',
+                 'patchmon-dc-reporter.ps1', 'setup-patchmon-dcs.ps1')
 $unsafe = foreach ($f in $unsafeFiles) {
     $tok = $null; $errs = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root $f), [ref]$tok, [ref]$errs)
