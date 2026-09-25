@@ -7,17 +7,19 @@
 .DESCRIPTION
     For DCs where installing the PatchMon agent binary is not permitted. Run
     this from an admin workstation or member server (never a DC); it touches
-    the DCs only through the C$ admin share and Task Scheduler over WinRM.
+    the DCs only over WinRM - no SMB/C$ admin share required, because many DCs
+    are hardened with those disabled.
 
     For each domain controller it will:
       1. Enroll the DC with PatchMon auto-enrollment FROM THIS HOST, so the
          shared enrollment secret is never written to a DC (per-DC api_id/api_key
          are cached in .\dc-credentials\ - keep that folder out of git and ACL
          it to yourself).
-      2. Copy patchmon-dc-reporter.ps1 to C:\Program Files\PatchMon-Reporter
-         and write that DC's own config.json + credentials.json beside it, then
-         strip inherited NTFS ACLs so only SYSTEM and Administrators can read
-         them (this is why we do not stage anything through SYSVOL).
+      2. Stage patchmon-dc-reporter.ps1 into C:\Program Files\PatchMon-Reporter
+         with that DC's own config.json + credentials.json over the WinRM
+         session, then strip inherited NTFS ACLs so only SYSTEM and
+         Administrators can read them (this is why we do not stage anything
+         through SYSVOL).
       3. Register a scheduled task (boot +5 min, then daily) running as SYSTEM
          that executes the reporter locally on the DC.
       4. Run it once and report the exit result.
@@ -255,7 +257,7 @@ if ($WhatIf) {
         $plan = @()
         if ((Test-Path -LiteralPath $cached) -and -not $RefreshCredentials) { $plan += 'reuse cached credentials' }
         else { $plan += 'auto-enroll (from this host)' }
-        $plan += "copy reporter to $RemoteDir"
+        $plan += "stage reporter + credentials over WinRM into $RemoteDir"
         $plan += 'strip NTFS inheritance (SYSTEM+Administrators only)'
         $plan += "register task '$TaskName' (boot +5 min, daily $DailyTime, SYSTEM)"
         $plan += 'run once'
@@ -292,31 +294,29 @@ foreach ($dc in $targets) {
             Write-Step $dc "enrolled (api_id=$apiId)"
         }
 
-        # 2. Stage code + this DC's own credentials over the admin share.
-        $unc = "\\$dc\C`$" + ($RemoteDir -replace ':', '')
-        if (-not (Test-Path -LiteralPath $unc)) {
-            New-Item -ItemType Directory -Path $unc -Force | Out-Null
-        }
-        Copy-Item -LiteralPath $ReporterSource -Destination (Join-Path $unc 'patchmon-dc-reporter.ps1') -Force
-
-        # UTF-8 without BOM; the reporter's ConvertFrom-Json is happier, and
-        # PS 5.1's Set-Content -Encoding UTF8 writes a BOM.
-        $enc = New-Object System.Text.UTF8Encoding($false)
+        # 2. Stage code + this DC's own credentials THROUGH THE WINRM SESSION
+        # itself. The first version copied over \\dc\C$, which fails with "The
+        # network name cannot be found" on any DC hardened to disable admin
+        # shares (AutoShareServer=0) - and Task Scheduler already needs WinRM,
+        # so SMB was a dependency bought for nothing.
+        $reporterText = Get-Content -LiteralPath $ReporterSource -Raw
+        # UTF-8 without BOM; PS 5.1's Set-Content -Encoding UTF8 writes a BOM.
         $cfgJson = @{ serverUrl = $ServerURL; skipTlsVerify = [bool]$SkipCertificateCheck } | ConvertTo-Json
-        [System.IO.File]::WriteAllText((Join-Path $unc 'config.json'), $cfgJson, $enc)
         $credJson = @{ apiId = $apiId; apiKey = $apiKey } | ConvertTo-Json
-        [System.IO.File]::WriteAllText((Join-Path $unc 'credentials.json'), $credJson, $enc)
-
-        # 3. NTFS: the default Program Files ACL lets every domain user read
-        # these files. Strip inheritance; keep only SYSTEM and Administrators.
         Invoke-Command -ComputerName $dc -ScriptBlock {
-            param($Dir, $DataDir)
+            param($Dir, $DataDir, $Code, $Cfg, $Cred)
+            New-Item -ItemType Directory -Path $Dir, $DataDir -Force | Out-Null
+            $enc = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText((Join-Path $Dir 'patchmon-dc-reporter.ps1'), $Code, $enc)
+            [System.IO.File]::WriteAllText((Join-Path $Dir 'config.json'), $Cfg, $enc)
+            [System.IO.File]::WriteAllText((Join-Path $Dir 'credentials.json'), $Cred, $enc)
+            # NTFS: the default Program Files ACL lets every domain user read
+            # these files. Strip inheritance; keep only SYSTEM and Administrators.
             foreach ($d in @($Dir, $DataDir)) {
-                if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
                 & icacls $d /inheritance:r /grant '*S-1-5-18:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' | Out-Null
             }
-        }
-        Write-Step $dc 'staged reporter + credentials (ACLs locked to SYSTEM/Admins)'
+        } -ArgumentList $RemoteDir, $RemoteDataDir, $reporterText, $cfgJson, $credJson
+        Write-Step $dc 'staged reporter + credentials over WinRM (ACLs locked to SYSTEM/Admins)'
 
         # 4. AllSigned check: -ExecutionPolicy Bypass is ignored under an
         # enforced policy, so an unsigned file simply will not run.

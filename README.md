@@ -167,8 +167,8 @@ sessions, and the reporter then degrades to installed-KBs-only and says so in
 `C:\ProgramData\PatchMon-Reporter\report.log`. The PatchMon agent has the same limitation (it falls
 back to a PowerShell module we may not install on DCs either).
 
-**Deployment** (from an admin workstation or member server, never a DC; needs the C$ admin share and
-WinRM on the DCs):
+**Deployment** (from an admin workstation or member server, never a DC; needs WinRM on the DCs -
+no SMB/C$ admin share, so DCs hardened with admin shares disabled still work):
 
 ```powershell
 # same three placeholders as the installer, then:
