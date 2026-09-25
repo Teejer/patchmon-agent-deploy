@@ -16,10 +16,10 @@
          are cached in .\dc-credentials\ - keep that folder out of git and ACL
          it to yourself).
       2. Stage patchmon-dc-reporter.ps1 into C:\Program Files\PatchMon-Reporter
-         with that DC's own config.json + credentials.json over the WinRM
-         session, then strip inherited NTFS ACLs so only SYSTEM and
-         Administrators can read them (this is why we do not stage anything
-         through SYSVOL).
+         and that DC's own config.json + credentials.json into
+         C:\ProgramData\PatchMon-Reporter over the WinRM session, then strip
+         inherited NTFS ACLs so only SYSTEM and Administrators can read them
+         (this is why we do not stage anything through SYSVOL).
       3. Register a scheduled task (boot +5 min, then daily) running as SYSTEM
          that executes the reporter locally on the DC.
       4. Run it once and report the exit result.
@@ -257,7 +257,7 @@ if ($WhatIf) {
         $plan = @()
         if ((Test-Path -LiteralPath $cached) -and -not $RefreshCredentials) { $plan += 'reuse cached credentials' }
         else { $plan += 'auto-enroll (from this host)' }
-        $plan += "stage reporter + credentials over WinRM into $RemoteDir"
+        $plan += 'stage reporter to $RemoteDir, credentials to $RemoteDataDir (over WinRM)'
         $plan += 'strip NTFS inheritance (SYSTEM+Administrators only)'
         $plan += "register task '$TaskName' (boot +5 min, daily $DailyTime, SYSTEM)"
         $plan += 'run once'
@@ -307,11 +307,16 @@ foreach ($dc in $targets) {
             param($Dir, $DataDir, $Code, $Cfg, $Cred)
             New-Item -ItemType Directory -Path $Dir, $DataDir -Force | Out-Null
             $enc = New-Object System.Text.UTF8Encoding($false)
+            # Code goes in Program Files; credentials and log go in ProgramData -
+            # the same split the real agent uses, and where the reporter looks for
+            # them. Writing all three to Program Files left the reporter reporting
+            # "not configured" (exit 0x2 from the task) against correctly staged
+            # files it would never read.
             [System.IO.File]::WriteAllText((Join-Path $Dir 'patchmon-dc-reporter.ps1'), $Code, $enc)
-            [System.IO.File]::WriteAllText((Join-Path $Dir 'config.json'), $Cfg, $enc)
-            [System.IO.File]::WriteAllText((Join-Path $Dir 'credentials.json'), $Cred, $enc)
-            # NTFS: the default Program Files ACL lets every domain user read
-            # these files. Strip inheritance; keep only SYSTEM and Administrators.
+            [System.IO.File]::WriteAllText((Join-Path $DataDir 'config.json'), $Cfg, $enc)
+            [System.IO.File]::WriteAllText((Join-Path $DataDir 'credentials.json'), $Cred, $enc)
+            # NTFS: the default ACLs let every domain user read these. Strip
+            # inheritance; keep only SYSTEM and Administrators.
             foreach ($d in @($Dir, $DataDir)) {
                 & icacls $d /inheritance:r /grant '*S-1-5-18:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' | Out-Null
             }

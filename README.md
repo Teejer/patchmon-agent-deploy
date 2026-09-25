@@ -181,8 +181,9 @@ git update-index --skip-worktree setup-patchmon-dcs.ps1
 
 Per DC it: auto-enrolls **from the workstation** (the shared enrollment secret never reaches a DC;
 the returned per-DC api_id/api_key are cached in `.\dc-credentials\`, which is gitignored - keep it
-ACL'd to yourself), copies the reporter to `C:\Program Files\PatchMon-Reporter` with its own
-`credentials.json`, strips inherited NTFS ACLs so only SYSTEM and Administrators can read them
+ACL'd to yourself), stages the reporter to `C:\Program Files\PatchMon-Reporter` and that DC's own
+`config.json`/`credentials.json` to `C:\ProgramData\PatchMon-Reporter` (same code/data split as the
+real agent), strips inherited NTFS ACLs on both so only SYSTEM and Administrators can read them
 (this is why nothing goes through SYSVOL), registers a scheduled task as SYSTEM (boot +5 minutes,
 then daily 03:25) and runs it once, reporting the exit result.
 

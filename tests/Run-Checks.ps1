@@ -482,6 +482,19 @@ if ($ignoreTxt -match '(?m)^dc-credentials/') {
 }
 else { $fail++; Write-Host 'FAIL  add dc-credentials/ to .gitignore' -ForegroundColor Red }
 
+# --- reporter reads, and setup writes, config/credentials in the SAME folder ---
+# The first DC run exited 0x2 ("not configured") because staging wrote the two
+# JSON files to Program Files while the reporter reads them from ProgramData.
+# The paths live in two files with nothing forcing agreement; this is that.
+$readerOk = $reporterSrc -match "Join-Path \`$env:ProgramData 'PatchMon-Reporter'"
+$writerOk = ($setupSrc -match "Join-Path \`$DataDir 'config\.json'") -and
+            ($setupSrc -match "Join-Path \`$DataDir 'credentials\.json'") -and
+            ($setupSrc -notmatch "Join-Path \`$Dir 'config\.json'")
+if ($readerOk -and $writerOk) {
+    Write-Host 'PASS  reporter and setup agree on the ProgramData credentials path'
+}
+else { $fail++; Write-Host "FAIL  reporter/setup credential paths diverged (reader=$readerOk writer=$writerOk)" -ForegroundColor Red }
+
 # --- param defaults must not depend on a possibly-null variable ---
 # A param default that calls Join-Path on $env:ProgramFiles / $env:USERPROFILE fails
 # during parameter binding - before logging, before the RSAT check, before anything
