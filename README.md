@@ -235,11 +235,55 @@ git show HEAD:patchmon-agent-install.ps1 | Select-String 'SIG # Begin' -Quiet   
 | Exit | Meaning |
 | --- | --- |
 | `0` | Installed and healthy, or was already installed (the normal daily outcome) |
-| `1` | Enrollment, download, credential, service or connectivity failure |
+| `1` | Enrollment, download, credential, config, service or connectivity failure |
 | `2` | Auto-enrollment key/secret are still the placeholders |
 
 - Deploy log: `C:\ProgramData\PatchMon\deploy.log` (installer decisions)
 - Agent log: `C:\ProgramData\PatchMon\patchmon-agent.log` (what the agent itself does)
+
+## config.yml and YAML quoting
+
+`C:\ProgramData\PatchMon\config.yml` must use **single-quoted** values for Windows paths:
+
+```yaml
+patchmon_server: 'https://patchmon.example.com'
+api_version: 'v1'
+credentials_file: 'C:\ProgramData\PatchMon\credentials.yml'
+log_file: 'C:\ProgramData\PatchMon\patchmon-agent.log'
+log_level: 'info'
+skip_ssl_verify: false
+```
+
+In YAML, a double-quoted scalar processes backslash escapes, so
+`credentials_file: "C:\ProgramData\PatchMon\credentials.yml"` is invalid - `\c` is an unknown
+escape - and some sequences are accepted but silently mangled. A literal apostrophe in a path is
+written as two (`'C:\Users\O''Neil\...'`). The file is written without a BOM for the same reason.
+
+Why this deserves care: when the agent cannot parse `config.yml` it does **not** stop. It prints a
+warning, replaces the file with its own defaults - which have no `patchmon_server` - and carries on.
+The host then never reports in and nothing looks broken. PatchMon's own installer has the same
+single-quote rule, so this script matches it.
+
+What the installer does with an existing file, rather than blindly keeping it:
+
+- rewrites any double-quoted path into single quotes
+- adds `patchmon_server` if it is missing (the signature of an agent-reset file)
+- updates `patchmon_server` and `skip_ssl_verify` to match what the script was told, which is how an
+  existing fleet moves from `http://host:3000` to `https://host` after you re-stage the installer
+- treats an empty or blank file as absent and writes a fresh one
+- refuses to continue (exit 1) if the file still would not parse, instead of letting the agent eat it
+
+`tests/Run-Checks.ps1` executes that code directly - fresh write, repair of a broken file,
+agent-reset file, empty file, path with an apostrophe - and fails if any key is lost. It also
+checks the gate that decides whether an installed agent can skip the installer, because a gate
+that is wrong in either direction either leaves a broken host alone or re-enrols healthy ones.
+
+If a client is already stuck on defaults, just run the installer again - or wait for the daily task,
+which now notices this by itself: the "already installed, nothing to do" exit only happens when
+`config.yml` is present, parseable and pointing at `$ServerURL`. Anything else goes through the
+repair path, which fixes the file, restarts the service and confirms with `patchmon-agent ping`
+before deciding whether a full reinstall is needed. That is also how an existing fleet picks up a new
+server URL after you re-stage the installer with HTTPS.
 
 ## TLS
 
@@ -252,9 +296,10 @@ Once HTTPS is on `patchmon.example.com`:
   cert experiment.
 - If you must use a self-signed server cert temporarily, deploy the server's CA cert to clients'
   Trusted Root store via GPO instead of skipping verification.
-- Existing clients keep the old URL in `config.yml` (the installer does not rewrite an existing
-  config). Use `uninstall-patchmon-agent.ps1 -RemoveData` + let the task reinstall, or edit
-  `C:\ProgramData\PatchMon\config.yml` and restart the service, when you switch URL.
+- Switching URL is now just: change `$ServerURL` in the installer, re-stage to SYSVOL, and let the
+  daily task run. The installer updates `patchmon_server` in an existing `config.yml` and restarts
+  nothing it does not have to - see [config.yml and YAML quoting](#configyml-and-yaml-quoting). Only
+  reach for `uninstall-patchmon-agent.ps1 -RemoveData` if a client's config is beyond repair.
 
 ## Keeping this repo public
 

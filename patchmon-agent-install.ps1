@@ -108,6 +108,127 @@ if (-not $ConfigPath) {
 
 $LogFile = Join-Path $ConfigPath 'deploy.log'
 
+# --- CONFIG-YAML-BEGIN : tests/Run-Checks.ps1 loads this block and calls the functions ---
+# YAML quoting matters here: a double-quoted scalar processes backslash escapes, so a
+# Windows path such as "C:\ProgramData\PatchMon\credentials.yml" either fails to parse
+# (\c is an unknown escape, which is what the agent complains about) or is silently
+# mangled. Single-quoted scalars take backslashes literally; a literal single quote
+# inside one is written as two.
+function Quote-YamlValue {
+    param([string]$Value)
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
+# Written without a BOM: Windows PowerShell 5.1's Set-Content -Encoding UTF8 prepends
+# one, and a leading BOM is another way to upset a YAML parser.
+function Write-ConfigFile {
+    param([string]$Path, [string]$Content)
+    [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Write-PatchMonConfig {
+    # Creates config.yml, or repairs the one that exists. Returns $false if the result
+    # would not parse, because the agent's response to an unparseable file is to replace
+    # it with defaults - a blank patchmon_server and a host that quietly never reports.
+    param(
+        [string]$ConfigDir = $ConfigPath,
+        [string]$Url = $ServerURL,
+        [bool]$SkipSsl = $SkipSslVerify
+    )
+    $file = Join-Path $ConfigDir 'config.yml'
+    $wantSkipSsl = $SkipSsl.ToString().ToLower()
+
+    $existing = $null
+    if (Test-Path -LiteralPath $file) {
+        $existing = Get-Content -LiteralPath $file -Raw -ErrorAction SilentlyContinue
+    }
+
+    if ([string]::IsNullOrWhiteSpace($existing)) {
+        # No file, or an empty one from an interrupted write. Appending to a blank file
+        # would give a config with no credentials_file or log_file, so start over.
+        if ($existing -ne $null) { Write-Log "$file exists but is empty, writing a fresh one." 'WARN' }
+        else { Write-Log "Writing $file ..." }
+        $configContent = @"
+patchmon_server: $(Quote-YamlValue $Url)
+api_version: 'v1'
+credentials_file: $(Quote-YamlValue (Join-Path $ConfigDir 'credentials.yml'))
+log_file: $(Quote-YamlValue (Join-Path $ConfigDir 'patchmon-agent.log'))
+log_level: 'info'
+skip_ssl_verify: $wantSkipSsl
+"@
+        Write-ConfigFile -Path $file -Content $configContent
+        return $true
+    }
+
+    Write-Log "Keeping existing $file, checking it for problems ..."
+    $content = $existing
+
+    # Repair paths written double-quoted by an earlier version of this script, which left
+    # the file unparseable and the agent running on defaults.
+    $doubleQuotedPath = '(?m)^([ \t]*)(patchmon_server|api_version|credentials_file|log_file|log_level)[ \t]*:[ \t]*"([^"]*\\[^"]*)"([ \t]*(?:#[^\r\n]*)?)(\r?)$'
+    $repaired = [regex]::Replace($content, $doubleQuotedPath, {
+        param($m)
+        '{0}{1}: {2}{3}{4}' -f $m.Groups[1].Value, $m.Groups[2].Value,
+            (Quote-YamlValue $m.Groups[3].Value), $m.Groups[4].Value, $m.Groups[5].Value
+    })
+    if ($repaired -ne $content) {
+        Write-Log 'Rewrote double-quoted Windows paths in config.yml; the agent could not parse them.' 'WARN'
+        $content = $repaired
+    }
+
+    # Keep these two in step with what the script was told, so re-staging a new installer
+    # also moves existing agents (for example http://host:3000 -> https://host). The key
+    # text is repeated in the replacement: the pattern consumes "key:" as part of the
+    # match, so a replacement of just $1 + value would delete the key and leave a bare
+    # value line, which is worse than the problem being fixed.
+    if ($content -match '(?m)^([ \t]*)skip_ssl_verify[ \t]*:[ \t]*(true|false)') {
+        $content = [regex]::Replace($content, '(?m)^([ \t]*)skip_ssl_verify[ \t]*:[ \t]*(true|false)', ('$1skip_ssl_verify: ' + $wantSkipSsl))
+    }
+    else {
+        $content = $content.TrimEnd() + "`nskip_ssl_verify: $wantSkipSsl`n"
+    }
+
+    if ($content -match "(?m)^([ \t]*)patchmon_server[ \t]*:[ \t]*(['`"]?)([^'`"\r\n]*)\2") {
+        $currentServer = $Matches[3].Trim()
+        if ($currentServer -ne $Url) {
+            Write-Log "Updating patchmon_server in config.yml: '$currentServer' -> '$Url'" 'WARN'
+            $content = [regex]::Replace($content, "(?m)^([ \t]*)patchmon_server[ \t]*:[ \t]*(['`"]?)[^'`"\r\n]*\2", ('$1patchmon_server: ' + (Quote-YamlValue $Url)))
+        }
+    }
+    else {
+        Write-Log "patchmon_server was missing from config.yml (the agent had fallen back to defaults); adding it." 'WARN'
+        $content = $content.TrimEnd() + "`n" + ('patchmon_server: ' + (Quote-YamlValue $Url)) + "`n"
+    }
+
+    Write-ConfigFile -Path $file -Content $content
+
+    # Check the file we are about to hand to the agent says what we mean.
+    $final = Get-Content -LiteralPath $file -Raw
+    if ($final -match '(?m)^[ \t]*[A-Za-z_]+[ \t]*:[ \t]*"[^"\r\n]*\\') {
+        Write-Log "config.yml still holds a double-quoted Windows path, which the agent cannot parse. Edit it by hand: $file" 'ERROR'
+        return $false
+    }
+    if ($final -notmatch "(?m)^patchmon_server[ \t]*:[ \t]*['`"]?$([regex]::Escape($Url))['`"]?\s*$") {
+        Write-Log "config.yml does not point at $Url. Check it by hand: $file" 'ERROR'
+        return $false
+    }
+    return $true
+}
+
+function Test-PatchMonConfigCurrent {
+    # Gates the "already installed, nothing to do" exit: false whenever config.yml needs
+    # this script's attention - missing, empty, unparsable quoting, or another server.
+    param([string]$ConfigDir = $ConfigPath, [string]$Url = $ServerURL)
+    $file = Join-Path $ConfigDir 'config.yml'
+    if (-not (Test-Path -LiteralPath $file)) { return $false }
+    $text = Get-Content -LiteralPath $file -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($text)) { return $false }
+    if ($text -match '(?m)^[ \t]*[A-Za-z_]+[ \t]*:[ \t]*"[^"\r\n]*\\') { return $false }
+    if ($text -notmatch "(?m)^patchmon_server[ \t]*:[ \t]*['`"]?$([regex]::Escape($Url))['`"]?\s*$") { return $false }
+    return $true
+}
+# --- CONFIG-YAML-END ---
+
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
     $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
@@ -219,19 +340,47 @@ if ($existingService -and -not $Force) {
     $binPath = Get-ServiceBinaryPath -Name $serviceName
 
     if ($binPath) {
-        if ($existingService.Status -ne 'Running') {
-            Write-Log "Service exists but is stopped, starting it."
-            Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if (Test-PatchMonConfigCurrent) {
+            if ($existingService.Status -ne 'Running') {
+                Write-Log "Service exists but is stopped, starting it."
+                Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+            }
+            # Deliberately not logged to deploy.log: this is the daily happy path.
+            Write-Host "PatchMon agent already installed and healthy, nothing to do."
+            exit 0
         }
-        # Deliberately not logged to deploy.log: this is the daily happy path.
-        Write-Host "PatchMon agent already installed and healthy, nothing to do."
-        exit 0
-    }
 
-    Write-Log "Service exists but its binary is missing, reinstalling." 'WARN'
-    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-    & sc.exe delete $serviceName | Out-Null
-    Start-Sleep -Seconds 2
+        # Installed, but config.yml is broken, empty, or points at another server. Repair it
+        # here rather than re-running the installer: the credentials on disk are still this
+        # host's, and calling auto-enrollment again for a host that already exists is a good
+        # way to get a 409 and a machine that never comes back.
+        Write-Log 'Agent is installed but config.yml needs attention; repairing it.' 'WARN'
+        try {
+            $configOk = Write-PatchMonConfig
+        }
+        catch {
+            Write-Log "Could not repair config.yml: $($_.Exception.Message)" 'ERROR'
+            exit 1
+        }
+        if ($configOk) {
+            Restart-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            & $targetPath --config $configFile ping
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log 'Config repaired and the agent answers ping.'
+                exit 0
+            }
+            Write-Log "Config repaired but the agent cannot reach $ServerURL (ping exit $LASTEXITCODE); continuing with a full reinstall, which re-enrols this host." 'WARN'
+        }
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+    }
+    else {
+        Write-Log "Service exists but its binary is missing, reinstalling." 'WARN'
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        & sc.exe delete $serviceName | Out-Null
+        Start-Sleep -Seconds 2
+    }
 }
 
 # -------------------------------------------------------------------- #
@@ -353,25 +502,27 @@ Write-Log "Creating install/config directories..."
 New-Item -ItemType Directory -Force -Path $InstallPath | Out-Null
 New-Item -ItemType Directory -Force -Path $ConfigPath | Out-Null
 
+# A running service locks its own executable, so the binary can only be replaced while
+# it is stopped. Step 4 starts it again.
+$runningService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+if ($runningService -and $runningService.Status -ne 'Stopped') {
+    Write-Log 'Stopping the running agent so its binary can be replaced...'
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+}
+
 Write-Log "Installing agent to $targetPath ..."
 Copy-Item -Path $tempPath -Destination $targetPath -Force
 Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
 
-if (-not (Test-Path $configFile)) {
-    Write-Log "Writing $configFile ..."
-    $configContent = @"
-patchmon_server: "$ServerURL"
-api_version: "v1"
-credentials_file: "$ConfigPath\credentials.yml"
-log_file: "$ConfigPath\patchmon-agent.log"
-log_level: "info"
-skip_ssl_verify: $($SkipSslVerify.ToString().ToLower())
-"@
-    Set-Content -Path $configFile -Value $configContent -Encoding UTF8
+try {
+    $configOk = Write-PatchMonConfig
 }
-else {
-    Write-Log "Keeping existing $configFile ..."
+catch {
+    Write-Log "$(_.Exception.Message)" 'ERROR'
+    exit 1
 }
+if (-not $configOk) { exit 1 }
 
 # PATH is a convenience for interactive use; the service does not need it.
 $currentPath = [Environment]::GetEnvironmentVariable('Path', [EnvironmentVariableTarget]::Machine)
@@ -399,20 +550,34 @@ Write-Log "Connectivity test passed."
 # -------------------------------------------------------------------- #
 #  Step 4 - Windows service                                            #
 # -------------------------------------------------------------------- #
-Write-Log "Creating Windows service '$serviceName' ..."
+$svcNow = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 try {
-    New-Service -Name $serviceName `
-        -BinaryPathName "`"$targetPath`" serve" `
-        -DisplayName $ServiceDisplayName `
-        -StartupType Automatic `
-        -ErrorAction Stop | Out-Null
+    if ($svcNow) {
+        # Reached from the repair path when the config fix alone was not enough. The service
+        # already points at $targetPath serve, which is where we just installed the binary,
+        # so it needs starting rather than creating.
+        Write-Log "Service '$serviceName' already exists, starting it with the new binary and config..."
+    }
+    else {
+        Write-Log "Creating Windows service '$serviceName' ..."
+        New-Service -Name $serviceName `
+            -BinaryPathName "`"$targetPath`" serve" `
+            -DisplayName $ServiceDisplayName `
+            -StartupType Automatic `
+            -ErrorAction Stop | Out-Null
+    }
 
     # -Description is PowerShell 6+ only.
     & sc.exe description $serviceName "$ServiceDescription" | Out-Null
     # Restart the agent if it ever crashes: 3 tries, a minute apart, counter resets daily.
     & sc.exe failure $serviceName reset= 86400 actions= restart/60000/restart/60000/restart/60000 | Out-Null
 
-    Start-Service -Name $serviceName
+    if ((Get-Service -Name $serviceName).Status -eq 'Running') {
+        Restart-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        Start-Service -Name $serviceName
+    }
     Start-Sleep -Seconds 3
 
     $svc = Get-Service -Name $serviceName
