@@ -459,6 +459,20 @@ else {
         Write-Host 'PASS  rebootReason suppressed when needsReboot is false'
     }
     else { $fail++; Write-Host 'FAIL  rebootReason sent without needsReboot; server would rewrite the column unguarded' -ForegroundColor Red }
+    # heartbeat partial: hostname-only, coherent per the server's rules
+    # (claimed hostname non-empty, unclaimed sections absent - a heartbeat must
+    # never be able to clobber the package inventory)
+    $hb = New-HeartbeatPayload -Hostname 'DC02' -MachineId 'm1'
+    $hbJson = ConvertTo-JsonSafe $hb
+    $hbParsed = $null
+    try { $hbParsed = $hbJson | ConvertFrom-Json } catch { }
+    $hbOk = ($null -ne $hbParsed) -and
+            (@($hbParsed.sections).Count -eq 1) -and
+            ("$($hbParsed.sections)" -eq 'hostname') -and
+            ($hbParsed.hostname -eq 'DC02') -and
+            ($hbJson -notmatch '"packages"') -and ($hbJson -notmatch '"hashes"')
+    if ($hbOk) { Write-Host 'PASS  heartbeat payload: hostname-only partial, nothing to clobber' }
+    else { $fail++; Write-Host "FAIL  heartbeat payload: $hbJson" -ForegroundColor Red }
 }
 
 # --- AGPL attribution: the reporter embeds PatchMon-derived logic ---

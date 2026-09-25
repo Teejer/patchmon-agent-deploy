@@ -50,6 +50,8 @@ param(
     [string]$CredentialsDir,
     [string]$LogFile,
     [switch]$DryRun,
+    [switch]$Heartbeat,
+    [switch]$Full,
     [switch]$SkipCertificateCheck
 )
 
@@ -61,6 +63,12 @@ if (-not $CredentialsDir) { $CredentialsDir = Join-Path $env:ProgramData 'PatchM
 if (-not $LogFile)       { $LogFile = Join-Path $CredentialsDir 'report.log' }
 
 $AgentVersionLabel = 'ps-reporter 1.0'
+
+# A full WUA collection is the expensive one; the 30-minute task run mostly
+# sends heartbeats. 12h keeps two full reports a day (boot and/or whatever
+# crosses the staleness line) and the online badge (3x update interval) fresh.
+$FullIntervalHours = 12
+$lastFullFile = Join-Path $CredentialsDir 'last_full.txt'
 
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
@@ -208,6 +216,23 @@ function New-ReportPayload {
     return $payload
 }
 
+function New-HeartbeatPayload {
+    # The PatchMon UI marks a host offline when last_update is older than
+    # 3x the configured update interval (dashboard.go), and last_update is
+    # refreshed by ANY accepted /hosts/update - including a partial report.
+    # This is that partial: hostname only, a few hundred bytes, no WUA COM,
+    # no Get-HotFix. Coherence rules honored: hostname non-empty, every
+    # unclaimed section absent/empty, and the server replaces package data
+    # only when the packages section is claimed.
+    param([string]$Hostname, [string]$MachineId, [string]$AgentVersion = 'ps-reporter 1.0')
+    return [ordered]@{
+        sections     = @('hostname')
+        hostname     = $Hostname
+        machineId    = $MachineId
+        agentVersion = $AgentVersion
+    }
+}
+
 # --- DC-REPORT-END ---
 
 function Get-HostIdentity {
@@ -293,6 +318,44 @@ function Get-RebootStatus {
     }
 }
 
+function Send-ReportJson {
+    # Posts a finished payload to /hosts/update; returns $true when the server
+    # accepts it. One function shared by the full and heartbeat paths so TLS
+    # handling and the 401 advice cannot drift between them.
+    param([string]$Json, [string]$Label = 'Report')
+    if ($SkipCertificateCheck) {
+        # PS 5.1 has no -SkipCertificateCheck; process-lifetime callback instead.
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    }
+    # PS 5.1 defaults to TLS 1.0 on some hosts; the server's TLS 1.2 is required.
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    try {
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
+        $resp = Invoke-RestMethod `
+            -Uri "$ServerURL/api/v1/hosts/update" `
+            -Method Post `
+            -Headers @{ 'X-API-ID' = $ApiId; 'X-API-KEY' = $ApiKey } `
+            -ContentType 'application/json' `
+            -Body $bodyBytes `
+            -TimeoutSec 180
+        $msg = 'ok'
+        if ($resp.message) { $msg = [string]$resp.message }
+        Write-Log "$Label delivered; server said: $msg"
+        return $true
+    }
+    catch {
+        $status = ''
+        try { if ($_.Exception.Response) { $status = [string][int]$_.Exception.Response.StatusCode } } catch { }
+        if ($status -eq '401') {
+            Write-Log "$Label rejected with HTTP 401. The host record may have been deleted in PatchMon; re-run setup-patchmon-dcs.ps1." 'ERROR'
+        }
+        else {
+            Write-Log "$Label failed${status}: $($_.Exception.Message)" 'ERROR'
+        }
+        return $false
+    }
+}
+
 # ------------------------------------------------------------------------ #
 #  Config and credentials                                                   #
 # ------------------------------------------------------------------------ #
@@ -322,6 +385,29 @@ if (-not $ServerURL -or -not $ApiId -or -not $ApiKey) {
 # ------------------------------------------------------------------------ #
 $collectStart = Get-Date
 Write-Log "=== PatchMon DC reporter starting ==="
+
+if ($Heartbeat -and $Full) { Write-Log '-Heartbeat and -Full are mutually exclusive.' 'ERROR'; exit 1 }
+$mode = 'full'
+if ($Heartbeat) {
+    $mode = 'heartbeat'
+}
+elseif (-not $Full -and -not $DryRun -and (Test-Path -LiteralPath $lastFullFile)) {
+    # Auto mode, which is what the scheduled task runs: the expensive full
+    # collection happens only once the previous one has gone stale.
+    try {
+        $age = (Get-Date) - (Get-Item -LiteralPath $lastFullFile).LastWriteTime
+        if ($age.TotalHours -lt $FullIntervalHours) { $mode = 'heartbeat' }
+    } catch { }
+}
+
+if ($mode -eq 'heartbeat') {
+    $hbMachineId = ''
+    try { $hbMachineId = [string](Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid } catch { }
+    $hbJson = ConvertTo-JsonSafe (New-HeartbeatPayload -Hostname ([string]$env:COMPUTERNAME) -MachineId $hbMachineId -AgentVersion $AgentVersionLabel)
+    Write-Log "Heartbeat mode (last full report under $FullIntervalHours hours old); payload is $($hbJson.Length) bytes"
+    if (Send-ReportJson -Json $hbJson -Label 'Heartbeat') { exit 0 }
+    exit 1
+}
 
 $packages = @()
 
@@ -409,35 +495,10 @@ if ($DryRun) {
 # ------------------------------------------------------------------------ #
 #  Report                                                                   #
 # ------------------------------------------------------------------------ #
-if ($SkipCertificateCheck) {
-    # PS 5.1 has no -SkipCertificateCheck; process-lifetime callback instead.
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-}
-# PS 5.1 defaults to TLS 1.0 on some hosts; the server's TLS 1.2 is required.
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-
-try {
-    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-    $resp = Invoke-RestMethod `
-        -Uri "$ServerURL/api/v1/hosts/update" `
-        -Method Post `
-        -Headers @{ 'X-API-ID' = $ApiId; 'X-API-KEY' = $ApiKey } `
-        -ContentType 'application/json' `
-        -Body $bodyBytes `
-        -TimeoutSec 180
-    $msg = 'ok'
-    if ($resp.message) { $msg = [string]$resp.message }
-    Write-Log "Report delivered ($($packages.Count) packages, needsReboot=$($reboot.needsReboot)); server said: $msg"
+if (Send-ReportJson -Json $json -Label ('Report ({0} packages, needsReboot={1})' -f $packages.Count, $reboot.needsReboot)) {
+    # Stamp the full report so the 30-minute task runs know a heartbeat
+    # is enough for the next $FullIntervalHours.
+    try { Set-Content -LiteralPath $lastFullFile -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') } catch { }
     exit 0
 }
-catch {
-    $status = ''
-    try { if ($_.Exception.Response) { $status = [string][int]$_.Exception.Response.StatusCode } } catch { }
-    if ($status -eq '401') {
-        Write-Log 'Server rejected the API credentials (HTTP 401). The host record may have been deleted in PatchMon; re-run setup-patchmon-dcs.ps1.' 'ERROR'
-    }
-    else {
-        Write-Log "Report failed${status}: $($_.Exception.Message)" 'ERROR'
-    }
-    exit 1
-}
+exit 1

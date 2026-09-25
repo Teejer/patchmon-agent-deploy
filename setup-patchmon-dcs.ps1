@@ -20,8 +20,9 @@
          C:\ProgramData\PatchMon-Reporter over the WinRM session, then strip
          inherited NTFS ACLs so only SYSTEM and Administrators can read them
          (this is why we do not stage anything through SYSVOL).
-      3. Register a scheduled task (boot +5 min, then daily) running as SYSTEM
-         that executes the reporter locally on the DC.
+      3. Register a scheduled task (boot +5 min, daily 03:25, and every 30
+         min) running as SYSTEM; the reporter self-decides full report vs
+         heartbeat on each run.
       4. Run it once and report the exit result.
 
     -Status re-checks task results and the reporter log tail on every DC.
@@ -259,7 +260,7 @@ if ($WhatIf) {
         else { $plan += 'auto-enroll (from this host)' }
         $plan += 'stage reporter to $RemoteDir, credentials to $RemoteDataDir (over WinRM)'
         $plan += 'strip NTFS inheritance (SYSTEM+Administrators only)'
-        $plan += "register task '$TaskName' (boot +5 min, daily $DailyTime, SYSTEM)"
+        $plan += "register task '$TaskName' (boot +5 min, daily $DailyTime, +30min heartbeat, SYSTEM)"
         $plan += 'run once'
         Write-Step $dc ($plan -join ' -> ')
     }
@@ -352,17 +353,25 @@ foreach ($dc in $targets) {
             $triggerBoot = New-ScheduledTaskTrigger -AtStartup
             $triggerBoot.Delay = 'PT5M'
             $triggerDaily = New-ScheduledTaskTrigger -Daily -At $DailyTime
+            # Every 30 min: the reporter itself decides full report vs heartbeat.
+            # The heartbeat partial keeps PatchMon's last_update inside the 3x
+            # update-interval window the UI uses for Up/stale/down; a full WUA
+            # collection only runs every 12h. (The "WS Offline" badge is NOT
+            # this - that one needs a live agent WebSocket and stays Offline by
+            # design for reporter hosts.)
+            $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date)
+            $triggerRepeat.Repetition.Interval = 'PT30M'
             $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                 -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
                 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5)
             if ($TaskUser) {
                 $principal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType Password -RunLevel Highest
-                Register-ScheduledTask -TaskName $Name -Action $action -Trigger @($triggerBoot, $triggerDaily) `
+                Register-ScheduledTask -TaskName $Name -Action $action -Trigger @($triggerBoot, $triggerDaily, $triggerRepeat) `
                     -Settings $settings -Principal $principal -Password $TaskPassword -Force | Out-Null
             }
             else {
                 $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-                Register-ScheduledTask -TaskName $Name -Action $action -Trigger @($triggerBoot, $triggerDaily) `
+                Register-ScheduledTask -TaskName $Name -Action $action -Trigger @($triggerBoot, $triggerDaily, $triggerRepeat) `
                     -Settings $settings -Principal $principal -Force | Out-Null
             }
         } -ArgumentList $TaskName, $RemoteDir, $DailyTime, $TaskUser, $taskPassword
