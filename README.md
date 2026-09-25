@@ -185,24 +185,27 @@ ACL'd to yourself), stages the reporter to `C:\Program Files\PatchMon-Reporter` 
 `config.json`/`credentials.json` to `C:\ProgramData\PatchMon-Reporter` (same code/data split as the
 real agent), strips inherited NTFS ACLs on both so only SYSTEM and Administrators can read them
 (this is why nothing goes through SYSVOL), registers a scheduled task as SYSTEM (boot +5 minutes,
-daily 03:25, and every 30 minutes) and runs it once, reporting the exit result.
+daily 03:25) and runs it once, reporting the exit result.
 
-**Two "offline" badges, only one of which we can fix.** PatchMon shows two different statuses and
-DCs behave differently in each:
+**Two "offline" badges, and what each one costs.** PatchMon shows two different statuses and DCs
+behave differently in each:
 
 - **Up / stale / down** is computed from `last_update`, refreshed by any accepted `/hosts/update`
-  (threshold: 3x the configured update interval, default 60 min → offline after 3h). A once-daily
-  report would leave DCs "offline" all day, so the task runs every 30 minutes and the reporter
+  (threshold: 3x the configured update interval, default 60 min → offline after 3h). The default
+  once-a-day schedule therefore shows DCs as offline for most of the day - that is accepted here,
+  the data is at most 24h old and nothing makes decisions off that badge. If that ever changes,
+  `setup-patchmon-dcs.ps1 -Heartbeat30m` makes the task fire every 30 minutes and the reporter
   self-decides: a **heartbeat** - a coherent hostname-only partial report of a few hundred bytes
-  that touches no inventory - keeps the badge green, and the full WUA collection runs every 12
-  hours. `-Heartbeat` / `-Full` force either mode by hand.
+  that touches no inventory - keeps the badge green, with the full WUA collection every 12 hours.
+  `-Heartbeat` / `-Full` force either mode on the reporter by hand.
 - **WS Offline / "WebSocket Disconnected"** is the agent registry: the agent binary holds a live
   WebSocket (`/api/v1/agents/ws`) for server-initiated actions ("Update Now", patch wizard). A
   scheduled reporter holds no socket, so this badge stays Offline on reporter hosts - permanently,
-  correctly, and harmlessly. It is the UI truthfully saying "interactive agent actions are not
-  available on this DC", which is exactly the policy that kept the agent off DCs. Do not "fix" it
-  with a persistent PowerShell daemon: that is an agent by another name, and a host that looks
-  online but never executes commands is worse than one that honestly reports offline.
+  correctly, and harmlessly, heartbeat or not. It is the UI truthfully saying "interactive agent
+  actions are not available on this DC", which is exactly the policy that kept the agent off DCs.
+  Do not "fix" it with a persistent PowerShell daemon: that is an agent by another name, and a
+  host that looks online but never executes commands is worse than one that honestly reports
+  offline.
 
 **Signing:** if your Default Domain Policy enforces AllSigned on DCs, the task's
 `-ExecutionPolicy Bypass` is ignored and `patchmon-dc-reporter.ps1` must be signed before staging

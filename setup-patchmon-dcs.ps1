@@ -20,9 +20,11 @@
          C:\ProgramData\PatchMon-Reporter over the WinRM session, then strip
          inherited NTFS ACLs so only SYSTEM and Administrators can read them
          (this is why we do not stage anything through SYSVOL).
-      3. Register a scheduled task (boot +5 min, daily 03:25, and every 30
-         min) running as SYSTEM; the reporter self-decides full report vs
-         heartbeat on each run.
+      3. Register a scheduled task (boot +5 min, daily 03:25) running as
+         SYSTEM. -Heartbeat30m additionally fires every 30 min so the UI's
+         Up/stale/down badge stays green (the reporter self-decides full
+         report vs heartbeat on each firing). Either way the "WS Offline"
+         badge stays Offline - that one needs a live agent WebSocket.
       4. Run it once and report the exit result.
 
     -Status re-checks task results and the reporter log tail on every DC.
@@ -69,6 +71,7 @@ param(
     [switch]$Status,
     [switch]$Uninstall,
     [switch]$RefreshCredentials,
+    [switch]$Heartbeat30m,
     [switch]$SkipCertificateCheck
 )
 
@@ -260,7 +263,8 @@ if ($WhatIf) {
         else { $plan += 'auto-enroll (from this host)' }
         $plan += 'stage reporter to $RemoteDir, credentials to $RemoteDataDir (over WinRM)'
         $plan += 'strip NTFS inheritance (SYSTEM+Administrators only)'
-        $plan += "register task '$TaskName' (boot +5 min, daily $DailyTime, +30min heartbeat, SYSTEM)"
+        if ($Heartbeat30m) { $plan += "register task '$TaskName' (boot +5 min, daily $DailyTime, +30min heartbeat, SYSTEM)" }
+        else { $plan += "register task '$TaskName' (boot +5 min, daily $DailyTime, SYSTEM)" }
         $plan += 'run once'
         Write-Step $dc ($plan -join ' -> ')
     }
@@ -345,7 +349,7 @@ foreach ($dc in $targets) {
             $taskPassword = [System.Net.NetworkCredential]::new('', $secure).Password
         }
         Invoke-Command -ComputerName $dc -ScriptBlock {
-            param($Name, $RemoteDir, $DailyTime, $TaskUser, $TaskPassword)
+            param($Name, $RemoteDir, $DailyTime, $TaskUser, $TaskPassword, $Heartbeat30m)
             Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue
 
             $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
@@ -353,28 +357,32 @@ foreach ($dc in $targets) {
             $triggerBoot = New-ScheduledTaskTrigger -AtStartup
             $triggerBoot.Delay = 'PT5M'
             $triggerDaily = New-ScheduledTaskTrigger -Daily -At $DailyTime
-            # Every 30 min: the reporter itself decides full report vs heartbeat.
-            # The heartbeat partial keeps PatchMon's last_update inside the 3x
-            # update-interval window the UI uses for Up/stale/down; a full WUA
-            # collection only runs every 12h. (The "WS Offline" badge is NOT
-            # this - that one needs a live agent WebSocket and stays Offline by
-            # design for reporter hosts.)
-            $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date)
-            $triggerRepeat.Repetition.Interval = 'PT30M'
+            $triggers = @($triggerBoot, $triggerDaily)
+            if ($Heartbeat30m) {
+                # Opt-in only. The 30-min firing exists solely to keep the
+                # Up/stale/down badge green (last_update vs 3x update interval);
+                # the reporter self-decides heartbeat vs full each firing. Once
+                # a day is a legitimate choice - the badge reads offline most
+                # of the day and the data is at most 24h old, which is fine
+                # unless someone starts making decisions off that badge.
+                $triggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date)
+                $triggerRepeat.Repetition.Interval = 'PT30M'
+                $triggers += $triggerRepeat
+            }
             $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                 -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
                 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5)
             if ($TaskUser) {
                 $principal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType Password -RunLevel Highest
-                Register-ScheduledTask -TaskName $Name -Action $action -Trigger @($triggerBoot, $triggerDaily, $triggerRepeat) `
+                Register-ScheduledTask -TaskName $Name -Action $action -Trigger $triggers `
                     -Settings $settings -Principal $principal -Password $TaskPassword -Force | Out-Null
             }
             else {
                 $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-                Register-ScheduledTask -TaskName $Name -Action $action -Trigger @($triggerBoot, $triggerDaily, $triggerRepeat) `
+                Register-ScheduledTask -TaskName $Name -Action $action -Trigger $triggers `
                     -Settings $settings -Principal $principal -Force | Out-Null
             }
-        } -ArgumentList $TaskName, $RemoteDir, $DailyTime, $TaskUser, $taskPassword
+        } -ArgumentList $TaskName, $RemoteDir, $DailyTime, $TaskUser, $taskPassword, [bool]$Heartbeat30m
         Write-Step $dc "task '$TaskName' registered"
 
         # 6. First run, then read its result so problems surface now, not at 03:25.
